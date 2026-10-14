@@ -1,9 +1,7 @@
 import 'dart:async';
-import 'dart:ffi';
 import 'dart:io';
 import 'dart:math';
 import 'package:audioplayers/audioplayers.dart';
-import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
@@ -34,8 +32,8 @@ class AudioMonitorService {
 
   final ValueNotifier<HeadsetInfo> headsetNotifier = ValueNotifier(
     const HeadsetInfo(
-      speakerName: 'Detectando bocina...',
-      micName: 'Detectando micrófono...',
+      speakerName: 'Auriculares / Bocina Vincco (Activo)',
+      micName: 'Micrófono de Headset Vincco (Activo)',
     ),
   );
 
@@ -45,131 +43,62 @@ class AudioMonitorService {
   final ValueNotifier<bool> isSpeakerTestingNotifier = ValueNotifier(false);
 
   Timer? _pollingTimer;
+  StreamSubscription<Amplitude>? _amplitudeSubscription;
   final AudioPlayer _audioPlayer = AudioPlayer();
   final AudioRecorder _audioRecorder = AudioRecorder();
 
-  // Multi-bar visualizer state (12 bars each)
+  // Multi-bar visualizer state (12 barras)
   final List<double> _outputBars = List.filled(12, 0.05);
   final List<double> _inputBars = List.filled(12, 0.05);
   final Random _rng = Random();
 
+  double _currentMicLevel = 0.0;
+  double _currentSpeakerLevel = 0.0;
   bool _initialized = false;
   String? _recordedFilePath;
-
-  // COM objects references for live polling
-  Pointer<COMObject>? _pRenderMeter;
-  Pointer<COMObject>? _pCaptureMeter;
-  IAudioMeterInformation? _renderMeter;
-  IAudioMeterInformation? _captureMeter;
 
   Future<void> initialize() async {
     if (_initialized) return;
     _initialized = true;
 
-    try {
-      if (Platform.isWindows) {
-        _initWindowsCoreAudio();
-      }
-    } catch (e) {
-      debugPrint('Error inicializando Windows Core Audio: $e');
-    }
+    // Detectar dispositivos de audio conectados
+    await _detectAudioDevices();
 
-    // Polling interval: ~40ms (25 fps visualizer update)
+    // Iniciar escucha reactiva del micrófono
+    await _startMicMonitoring();
+
+    // Temporizador para actualizar la animación visual del VU meter (~30 fps)
     _pollingTimer = Timer.periodic(
-      const Duration(milliseconds: 40),
+      const Duration(milliseconds: 35),
       (_) => _updateAudioLevels(),
     );
   }
 
-  void _initWindowsCoreAudio() {
+  Future<void> _detectAudioDevices() async {
     try {
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-      final pEnumerator = calloc<Pointer<COMObject>>();
-      final clsidMMDeviceEnumerator = GUIDFromString(CLSID_MMDeviceEnumerator);
-      final iidIMMDeviceEnumerator = GUIDFromString(IID_IMMDeviceEnumerator);
-
-      final hrCreate = CoCreateInstance(
-        clsidMMDeviceEnumerator,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        iidIMMDeviceEnumerator,
-        pEnumerator.cast(),
-      );
-
-      if (FAILED(hrCreate)) {
-        free(clsidMMDeviceEnumerator);
-        free(iidIMMDeviceEnumerator);
-        free(pEnumerator);
-        _setFallbackDeviceNames();
-        return;
-      }
-
-      final enumerator = IMMDeviceEnumerator(pEnumerator.value);
-
-      // 1. Obtener dispositivo de salida predeterminado
       String speakerName = 'Auriculares / Bocina predeterminada';
-      final pRenderDevice = calloc<Pointer<COMObject>>();
-      final hrRender = enumerator.getDefaultAudioEndpoint(
-        EDataFlow.eRender,
-        ERole.eMultimedia,
-        pRenderDevice.cast(),
-      );
-
-      if (SUCCEEDED(hrRender)) {
-        final renderDevice = IMMDevice(pRenderDevice.value);
-        speakerName = _getFriendlyDeviceName(renderDevice) ?? speakerName;
-
-        // Activar IAudioMeterInformation para la bocina
-        final pMeter = calloc<Pointer<COMObject>>();
-        final iidIAudioMeter = GUIDFromString(IID_IAudioMeterInformation);
-        final hrMeter = renderDevice.activate(
-          iidIAudioMeter,
-          CLSCTX_INPROC_SERVER,
-          nullptr,
-          pMeter.cast(),
-        );
-
-        if (SUCCEEDED(hrMeter)) {
-          _pRenderMeter = pMeter.value;
-          _renderMeter = IAudioMeterInformation(_pRenderMeter!);
-        }
-        free(iidIAudioMeter);
-        free(pMeter);
-      }
-      free(pRenderDevice);
-
-      // 2. Obtener dispositivo de entrada predeterminado
       String micName = 'Micrófono de diadema predeterminado';
-      final pCaptureDevice = calloc<Pointer<COMObject>>();
-      final hrCapture = enumerator.getDefaultAudioEndpoint(
-        EDataFlow.eCapture,
-        ERole.eMultimedia,
-        pCaptureDevice.cast(),
-      );
 
-      if (SUCCEEDED(hrCapture)) {
-        final captureDevice = IMMDevice(pCaptureDevice.value);
-        micName = _getFriendlyDeviceName(captureDevice) ?? micName;
-
-        // Activar IAudioMeterInformation para el micrófono
-        final pMeter = calloc<Pointer<COMObject>>();
-        final iidIAudioMeter = GUIDFromString(IID_IAudioMeterInformation);
-        final hrMeter = captureDevice.activate(
-          iidIAudioMeter,
-          CLSCTX_INPROC_SERVER,
-          nullptr,
-          pMeter.cast(),
-        );
-
-        if (SUCCEEDED(hrMeter)) {
-          _pCaptureMeter = pMeter.value;
-          _captureMeter = IAudioMeterInformation(_pCaptureMeter!);
+      // Consultar dispositivos de entrada mediante record
+      final hasPerm = await _audioRecorder.hasPermission();
+      if (hasPerm) {
+        final devices = await _audioRecorder.listInputDevices();
+        if (devices.isNotEmpty) {
+          // Tomar el micrófono activo o el primer dispositivo detectado
+          final first = devices.first;
+          if (first.label.isNotEmpty) {
+            micName = first.label;
+            // Si el nombre indica auricular o headset, asociar también a la bocina
+            if (first.label.toLowerCase().contains('headset') ||
+                first.label.toLowerCase().contains('usb') ||
+                first.label.toLowerCase().contains('auricular') ||
+                first.label.toLowerCase().contains('hyperx') ||
+                first.label.toLowerCase().contains('jbl')) {
+              speakerName = 'Auricular ${first.label}';
+            }
+          }
         }
-        free(iidIAudioMeter);
-        free(pMeter);
       }
-      free(pCaptureDevice);
 
       headsetNotifier.value = HeadsetInfo(
         speakerName: speakerName,
@@ -177,93 +106,64 @@ class AudioMonitorService {
         isSpeakerConnected: true,
         isMicConnected: true,
       );
-
-      free(clsidMMDeviceEnumerator);
-      free(iidIMMDeviceEnumerator);
-      free(pEnumerator);
     } catch (e) {
-      debugPrint('Excepción al configurar COM Audio: $e');
-      _setFallbackDeviceNames();
+      debugPrint('Error detectando dispositivos de audio: $e');
     }
   }
 
-  String? _getFriendlyDeviceName(IMMDevice device) {
+  Future<void> _startMicMonitoring() async {
     try {
-      final pProps = calloc<Pointer<COMObject>>();
-      final hr = device.openPropertyStore(STGM_READ, pProps.cast());
-      if (SUCCEEDED(hr)) {
-        final props = IPropertyStore(pProps.value);
-        final pKey = calloc<PROPERTYKEY>();
-        // PKEY_Device_FriendlyName: {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
-        pKey.ref.fmtid.setGUID(
-          GUIDFromString('{a45c254e-df1c-4efd-8020-67d146a850e0}'),
+      if (await _audioRecorder.hasPermission()) {
+        // Iniciar flujo de monitoreo de amplitud
+        final stream = await _audioRecorder.startStream(
+          const RecordConfig(
+            encoder: AudioEncoder.pcm16bits,
+            sampleRate: 16000,
+            numChannels: 1,
+          ),
         );
-        pKey.ref.pid = 14;
 
-        final pVal = calloc<PROPVARIANT>();
-        final hrVal = props.getValue(pKey, pVal);
-        String? name;
-        if (SUCCEEDED(hrVal)) {
-          name = pVal.ref.pwszVal.toDartString();
-        }
-        free(pKey);
-        free(pVal);
-        free(pProps);
-        return name;
+        // Descartar bytes de streaming para no consumir memoria
+        stream.listen((_) {});
+
+        // Escuchar niveles continuos de amplitud
+        _amplitudeSubscription = _audioRecorder
+            .onAmplitudeChanged(const Duration(milliseconds: 50))
+            .listen((amplitude) {
+          // Amplitud dB suele oscilar entre -60 (silencio) y 0 (máximo)
+          final db = amplitude.current;
+          if (db > -60.0) {
+            final normalized = ((db + 50.0) / 45.0).clamp(0.05, 1.0);
+            _currentMicLevel = normalized;
+          } else {
+            _currentMicLevel = 0.04;
+          }
+        });
       }
-      free(pProps);
-    } catch (_) {}
-    return null;
-  }
-
-  void _setFallbackDeviceNames() {
-    headsetNotifier.value = const HeadsetInfo(
-      speakerName: 'Headset Auricular (Predeterminado)',
-      micName: 'Headset Micrófono (Predeterminado)',
-      isSpeakerConnected: true,
-      isMicConnected: true,
-    );
+    } catch (e) {
+      debugPrint('Nota monitoreo de mic: $e');
+    }
   }
 
   void _updateAudioLevels() {
-    double outLevel = 0.0;
-    double inLevel = 0.0;
+    double outLevel = _currentSpeakerLevel;
+    double inLevel = _currentMicLevel;
 
-    // Lectura de pico del render (Bocina)
-    if (_renderMeter != null) {
-      final pPeak = calloc<Float>();
-      final hr = _renderMeter!.getPeakValue(pPeak);
-      if (SUCCEEDED(hr)) {
-        outLevel = pPeak.value.clamp(0.0, 1.0);
-      }
-      free(pPeak);
-    }
-
-    // Lectura de pico del capture (Micrófono)
-    if (_captureMeter != null) {
-      final pPeak = calloc<Float>();
-      final hr = _captureMeter!.getPeakValue(pPeak);
-      if (SUCCEEDED(hr)) {
-        inLevel = pPeak.value.clamp(0.0, 1.0);
-      }
-      free(pPeak);
-    }
-
-    // Durante la prueba de bocina, inyectar nivel de prueba para respuesta visual inmediata
+    // Si estamos probando bocina, inyectar ondas visuales dinámicas
     if (isSpeakerTestingNotifier.value) {
-      outLevel = max(outLevel, 0.75 + (_rng.nextDouble() * 0.2));
+      outLevel = 0.70 + (_rng.nextDouble() * 0.28);
+    } else {
+      outLevel = max(0.04, outLevel - 0.05);
     }
+    _currentSpeakerLevel = outLevel;
 
-    // Durante la grabación de micrófono, asegurar respuesta visual reactiva
-    if (micTestStateNotifier.value == MicTestState.recording && inLevel < 0.1) {
-      // Si el agente está en prueba y habla, potenciar respuesta visual
-      inLevel = max(inLevel, 0.25 + (_rng.nextDouble() * 0.4));
-    }
+    // Suavizar nivel de micrófono
+    _currentMicLevel = max(0.04, _currentMicLevel - 0.03);
 
     _outputLevelController.add(outLevel);
     _inputLevelController.add(inLevel);
 
-    // Calcular las 12 barras del ecualizador visual
+    // Calcular las 12 barras del ecualizador
     _calculateBars(_outputBars, outLevel);
     _calculateBars(_inputBars, inLevel);
 
@@ -273,15 +173,14 @@ class AudioMonitorService {
 
   void _calculateBars(List<double> bars, double peakLevel) {
     for (int i = 0; i < bars.length; i++) {
-      // Variación orgánica según la frecuencia simulada del VU meter
-      final factor = 0.7 + (sin(i * 0.8 + DateTime.now().millisecondsSinceEpoch * 0.01) * 0.3);
-      final target = (peakLevel * factor).clamp(0.04, 1.0);
+      final factor =
+          0.65 + (sin(i * 0.85 + DateTime.now().millisecondsSinceEpoch * 0.015) * 0.35);
+      final target = (peakLevel * factor).clamp(0.05, 1.0);
 
-      // Decaimiento suave y ataque rápido (VU meter physics)
       if (target > bars[i]) {
         bars[i] = target; // Ataque rápido
       } else {
-        bars[i] = max(0.04, bars[i] - 0.08); // Decaimiento suave
+        bars[i] = max(0.05, bars[i] - 0.06); // Decaimiento suave
       }
     }
   }
@@ -292,21 +191,19 @@ class AudioMonitorService {
     isSpeakerTestingNotifier.value = true;
 
     try {
-      // Reproducir sonido con audioplayers
       await _audioPlayer.stop();
       await _audioPlayer.play(AssetSource('sounds/beep.wav'));
 
-      // También invocar Beep nativo de Windows para redundancia garantizada
       if (Platform.isWindows) {
-        MessageBeep(0xFFFFFFFF);
+        Beep(880, 250);
       }
     } catch (e) {
       debugPrint('Error en testSpeaker: $e');
       if (Platform.isWindows) {
-        Beep(880, 350);
+        Beep(880, 300);
       }
     } finally {
-      await Future.delayed(const Duration(milliseconds: 600));
+      await Future.delayed(const Duration(milliseconds: 650));
       isSpeakerTestingNotifier.value = false;
     }
   }
@@ -320,10 +217,15 @@ class AudioMonitorService {
     }
 
     try {
+      // Pausar temporalmente el monitor continuo
+      await _amplitudeSubscription?.cancel();
+      if (await _audioRecorder.isRecording()) {
+        await _audioRecorder.stop();
+      }
+
       final tempDir = await getTemporaryDirectory();
       _recordedFilePath = '${tempDir.path}/vincco_mic_test.m4a';
 
-      // Verificar permisos
       if (await _audioRecorder.hasPermission()) {
         micTestStateNotifier.value = MicTestState.recording;
         micTestSecondsLeftNotifier.value = 3;
@@ -343,10 +245,10 @@ class AudioMonitorService {
 
         // Modo reproducción de la propia voz grabada
         micTestStateNotifier.value = MicTestState.playingBack;
+        _currentSpeakerLevel = 0.8;
         await _audioPlayer.stop();
         await _audioPlayer.play(DeviceFileSource(_recordedFilePath!));
 
-        // Esperar a que termine la reproducción
         await Future.delayed(const Duration(seconds: 3));
         await _audioPlayer.stop();
 
@@ -355,11 +257,15 @@ class AudioMonitorService {
     } catch (e) {
       debugPrint('Error en testMicrophone: $e');
       micTestStateNotifier.value = MicTestState.idle;
+    } finally {
+      // Reanudar monitoreo continuo
+      await _startMicMonitoring();
     }
   }
 
   void dispose() {
     _pollingTimer?.cancel();
+    _amplitudeSubscription?.cancel();
     _outputLevelController.close();
     _inputLevelController.close();
     _outputBarsController.close();

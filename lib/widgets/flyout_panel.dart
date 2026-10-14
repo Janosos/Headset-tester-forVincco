@@ -455,10 +455,11 @@ class FlyoutPanel extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           const Text(
-            'v1.0 • Vincco Operaciones',
+            'Desarrollado por: ImperioDev',
             style: TextStyle(
               fontSize: 10,
               color: Color(0xFF64748B),
+              fontWeight: FontWeight.w500,
             ),
           ),
           InkWell(

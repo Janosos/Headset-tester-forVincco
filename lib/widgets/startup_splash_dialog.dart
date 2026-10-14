@@ -312,6 +312,18 @@ class _StartupSplashDialogState extends State<StartupSplashDialog> {
                 ),
               ),
             ),
+            const SizedBox(height: 8),
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Desarrollado por: ImperioDev',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Color(0xFF64748B),
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
           ],
         ),
       ),

@@ -40,6 +40,7 @@ dependencies:
   window_manager: ^0.5.2
   audioplayers: ^6.8.1
   record: ^7.1.2
+  screen_retriever: ^0.2.2
 
 dev_dependencies:
   flutter_test:
